@@ -1,0 +1,2 @@
+bandit>=1.7.0
+semgrep>=1.0.0
