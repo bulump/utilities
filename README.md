@@ -11,20 +11,20 @@ A comprehensive security scanner that combines industry-standard security analys
 **Features:**
 - Runs **Bandit** (Python security scanner) to detect Python-specific vulnerabilities
 - Runs **Semgrep** (multi-language SAST) for cross-language security analysis
+- Runs **pip-audit** to scan Python dependencies for known CVEs
+- Runs **detect-secrets** to find hardcoded secrets and credentials
 - Provides detailed and summary reporting modes
 - Exports results to JSON for CI/CD integration
 - Categorizes issues by severity (High/Medium/Low)
 - Returns proper exit codes for automation
 
 **Detects:**
-- SQL injection vulnerabilities
-- Cross-site scripting (XSS) risks
-- Hardcoded secrets and API keys
-- Insecure cryptographic practices
-- Command injection vulnerabilities
-- Path traversal issues
-- Unsafe deserialization
-- And many more security issues
+- **Code vulnerabilities:** SQL injection, XSS, command injection, path traversal
+- **Dependency vulnerabilities:** Known CVEs in Python packages (via pip-audit)
+- **Secrets:** Hardcoded API keys, passwords, tokens, credentials (via detect-secrets)
+- **Cryptographic issues:** Weak algorithms, insecure key generation
+- **Unsafe practices:** Insecure deserialization, eval/exec usage
+- And many more security issues across multiple languages
 
 ## Installation
 
@@ -33,7 +33,13 @@ A comprehensive security scanner that combines industry-standard security analys
 Install the security scanning tools:
 
 ```bash
-pip install bandit semgrep
+pip install bandit semgrep pip-audit detect-secrets
+```
+
+Or install from the repository's requirements.txt:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ### Clone this repository
@@ -83,13 +89,15 @@ Repository: /path/to/your/repo
 
 Running Bandit (Python Security Scanner)...
 Running Semgrep (Multi-language SAST)...
+Running pip-audit (Dependency Vulnerability Scanner)...
+Running detect-secrets (Secret Detection)...
 
 ================================================================================
 SECURITY SCAN RESULTS
 ================================================================================
 
 Repository: /path/to/your/repo
-Scan Date: 2025-10-23T16:30:00
+Scan Date: 2025-10-24T14:56:33
 
 BANDIT (Python Security)
 --------------------------------------------------------------------------------
@@ -107,16 +115,30 @@ SEMGREP (Multi-language SAST)
     Warnings/Medium: 3
     Info/Low: 2
 
+PIP-AUDIT (Dependency Vulnerabilities)
+--------------------------------------------------------------------------------
+  Status: ⚠️  VULNERABILITIES FOUND
+  Total Vulnerabilities: 2
+  Files Scanned: 1
+
+DETECT-SECRETS (Secret Detection)
+--------------------------------------------------------------------------------
+  Status: ✅ PASS
+  Total Secrets: 0
+  Files with Secrets: 0
+
 ================================================================================
 SUMMARY
 ================================================================================
 
-Overall Status: PASS
-Total Issues: 8
-Critical Issues: 0
+Overall Status: WARN
+Total Issues: 10
+Critical Issues: 2
+Vulnerable Dependencies: 2
 
 Recommendations:
   • Review and address medium/low severity issues
+  • Update vulnerable dependencies to secure versions
 ```
 
 ## Exit Codes
@@ -131,7 +153,7 @@ Add to your GitHub Actions workflow:
 ```yaml
 - name: Run Security Scan
   run: |
-    pip install bandit semgrep
+    pip install bandit semgrep pip-audit detect-secrets
     python script_security_scanner.py . --json security-results.json
 
 - name: Upload Security Results
@@ -139,6 +161,15 @@ Add to your GitHub Actions workflow:
   with:
     name: security-scan-results
     path: security-results.json
+```
+
+Or use the requirements.txt:
+
+```yaml
+- name: Run Security Scan
+  run: |
+    pip install -r requirements.txt
+    python script_security_scanner.py . --detailed --json security-results.json
 ```
 
 ## Requirements

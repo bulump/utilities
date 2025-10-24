@@ -1,2 +1,4 @@
 bandit>=1.7.0
 semgrep>=1.0.0
+pip-audit>=2.6.0
+detect-secrets>=1.4.0

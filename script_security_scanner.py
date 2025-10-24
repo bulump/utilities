@@ -37,6 +37,8 @@ class SecurityScanner:
             'repository': str(self.repo_path),
             'bandit': None,
             'semgrep': None,
+            'pip_audit': None,
+            'detect_secrets': None,
             'summary': None
         }
 
@@ -58,6 +60,20 @@ class SecurityScanner:
         except (subprocess.CalledProcessError, FileNotFoundError):
             tools['semgrep'] = False
 
+        # Check pip-audit
+        try:
+            subprocess.run(['pip-audit', '--version'], capture_output=True, check=True)
+            tools['pip_audit'] = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tools['pip_audit'] = False
+
+        # Check detect-secrets
+        try:
+            subprocess.run(['detect-secrets', '--version'], capture_output=True, check=True)
+            tools['detect_secrets'] = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tools['detect_secrets'] = False
+
         return tools
 
     def run_bandit(self) -> Dict[str, Any]:
@@ -70,8 +86,10 @@ class SecurityScanner:
         print("Running Bandit (Python Security Scanner)...")
 
         try:
+            # Exclude venv and other common directories
             result = subprocess.run(
-                ['bandit', '-r', str(self.repo_path), '-ll', '-f', 'json'],
+                ['bandit', '-r', str(self.repo_path), '-ll', '-f', 'json',
+                 '--exclude', '*/venv/*,*/.venv/*,*/env/*,*/node_modules/*'],
                 capture_output=True,
                 text=True,
                 timeout=300
@@ -80,6 +98,9 @@ class SecurityScanner:
             # Bandit returns 0 for no issues, 1 for issues found
             if result.returncode in [0, 1]:
                 try:
+                    if not result.stdout:
+                        return {'status': 'error', 'message': 'Bandit produced no output'}
+
                     data = json.loads(result.stdout)
                     issues = data.get('results', [])
 
@@ -97,8 +118,8 @@ class SecurityScanner:
                         'details': issues,
                         'metrics': data.get('metrics', {})
                     }
-                except json.JSONDecodeError:
-                    return {'status': 'error', 'message': 'Failed to parse Bandit output'}
+                except json.JSONDecodeError as e:
+                    return {'status': 'error', 'message': f'Failed to parse Bandit output: {str(e)}'}
             else:
                 return {'status': 'error', 'message': result.stderr}
 
@@ -157,9 +178,118 @@ class SecurityScanner:
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
 
+    def run_pip_audit(self) -> Dict[str, Any]:
+        """
+        Run pip-audit to check for vulnerable dependencies.
+
+        Returns:
+            Dictionary with pip-audit results
+        """
+        print("Running pip-audit (Dependency Vulnerability Scanner)...")
+
+        try:
+            # Look for requirements.txt files
+            requirements_files = list(self.repo_path.glob('**/requirements.txt'))
+
+            if not requirements_files:
+                return {
+                    'status': 'skipped',
+                    'message': 'No requirements.txt found',
+                    'total_vulnerabilities': 0
+                }
+
+            all_vulnerabilities = []
+
+            for req_file in requirements_files:
+                result = subprocess.run(
+                    ['pip-audit', '--requirement', str(req_file), '--format', 'json'],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+
+                try:
+                    if result.stdout:
+                        data = json.loads(result.stdout)
+                        vulnerabilities = data.get('vulnerabilities', [])
+
+                        for vuln in vulnerabilities:
+                            vuln['requirements_file'] = str(req_file.relative_to(self.repo_path))
+                            all_vulnerabilities.append(vuln)
+                except json.JSONDecodeError:
+                    pass
+
+            return {
+                'status': 'success',
+                'total_vulnerabilities': len(all_vulnerabilities),
+                'details': all_vulnerabilities,
+                'files_scanned': len(requirements_files)
+            }
+
+        except subprocess.TimeoutExpired:
+            return {'status': 'error', 'message': 'pip-audit scan timed out'}
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
+    def run_detect_secrets(self) -> Dict[str, Any]:
+        """
+        Run detect-secrets to find secrets in code.
+
+        Returns:
+            Dictionary with detect-secrets results
+        """
+        print("Running detect-secrets (Secret Detection)...")
+
+        try:
+            # Exclude common directories that have false positives
+            result = subprocess.run(
+                ['detect-secrets', 'scan', '--all-files',
+                 '--exclude-files', 'venv/.*',
+                 '--exclude-files', '.venv/.*',
+                 '--exclude-files', 'env/.*',
+                 '--exclude-files', 'node_modules/.*',
+                 '--exclude-files', '.git/.*',
+                 str(self.repo_path)],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            try:
+                data = json.loads(result.stdout)
+                results_data = data.get('results', {})
+
+                # Count total secrets found
+                total_secrets = sum(len(secrets) for secrets in results_data.values())
+
+                # Collect all secrets with file information
+                secrets_list = []
+                for filepath, secrets in results_data.items():
+                    for secret in secrets:
+                        secrets_list.append({
+                            'file': filepath,
+                            'type': secret.get('type'),
+                            'line_number': secret.get('line_number'),
+                            'hashed_secret': secret.get('hashed_secret')
+                        })
+
+                return {
+                    'status': 'success',
+                    'total_secrets': total_secrets,
+                    'files_with_secrets': len(results_data),
+                    'details': secrets_list
+                }
+            except json.JSONDecodeError:
+                return {'status': 'error', 'message': 'Failed to parse detect-secrets output'}
+
+        except subprocess.TimeoutExpired:
+            return {'status': 'error', 'message': 'detect-secrets scan timed out'}
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
     def run_scan(self) -> Dict[str, Any]:
         """
-        Run full security scan with both tools.
+        Run full security scan with all tools.
 
         Returns:
             Complete scan results
@@ -167,10 +297,10 @@ class SecurityScanner:
         # Check tool availability
         tools = self._ensure_tools_installed()
 
-        if not tools['bandit'] and not tools['semgrep']:
+        if not any(tools.values()):
             raise RuntimeError(
-                "Neither Bandit nor Semgrep is installed. "
-                "Install with: pip install bandit semgrep"
+                "No security tools installed. "
+                "Install with: pip install bandit semgrep pip-audit detect-secrets"
             )
 
         # Run Bandit
@@ -187,6 +317,20 @@ class SecurityScanner:
             print("⚠️  Semgrep not installed, skipping multi-language scan")
             self.results['semgrep'] = {'status': 'skipped', 'message': 'Tool not installed'}
 
+        # Run pip-audit
+        if tools.get('pip_audit'):
+            self.results['pip_audit'] = self.run_pip_audit()
+        else:
+            print("⚠️  pip-audit not installed, skipping dependency vulnerability scan")
+            self.results['pip_audit'] = {'status': 'skipped', 'message': 'Tool not installed'}
+
+        # Run detect-secrets
+        if tools.get('detect_secrets'):
+            self.results['detect_secrets'] = self.run_detect_secrets()
+        else:
+            print("⚠️  detect-secrets not installed, skipping secret detection")
+            self.results['detect_secrets'] = {'status': 'skipped', 'message': 'Tool not installed'}
+
         # Generate summary
         self.results['summary'] = self._generate_summary()
 
@@ -198,6 +342,8 @@ class SecurityScanner:
             'overall_status': 'PASS',
             'total_issues': 0,
             'critical_issues': 0,
+            'vulnerable_dependencies': 0,
+            'secrets_found': 0,
             'recommendations': []
         }
 
@@ -215,6 +361,22 @@ class SecurityScanner:
             summary['total_issues'] += semgrep_total
             summary['critical_issues'] += semgrep_errors
 
+        # pip-audit summary
+        if self.results['pip_audit'] and self.results['pip_audit'].get('status') == 'success':
+            pip_audit_vulns = self.results['pip_audit']['total_vulnerabilities']
+            summary['total_issues'] += pip_audit_vulns
+            summary['vulnerable_dependencies'] = pip_audit_vulns
+            if pip_audit_vulns > 0:
+                summary['critical_issues'] += pip_audit_vulns
+
+        # detect-secrets summary
+        if self.results['detect_secrets'] and self.results['detect_secrets'].get('status') == 'success':
+            secrets = self.results['detect_secrets']['total_secrets']
+            summary['total_issues'] += secrets
+            summary['secrets_found'] = secrets
+            if secrets > 0:
+                summary['critical_issues'] += secrets
+
         # Determine overall status
         if summary['critical_issues'] > 0:
             summary['overall_status'] = 'FAIL'
@@ -224,6 +386,12 @@ class SecurityScanner:
             summary['recommendations'].append('Review and address medium/low severity issues')
         else:
             summary['recommendations'].append('No security issues detected - great job!')
+
+        # Specific recommendations
+        if summary['vulnerable_dependencies'] > 0:
+            summary['recommendations'].append('Update vulnerable dependencies to secure versions')
+        if summary['secrets_found'] > 0:
+            summary['recommendations'].append('Remove hardcoded secrets and use environment variables')
 
         return summary
 
@@ -286,6 +454,51 @@ class SecurityScanner:
                 print(f"  Status: {semgrep.get('status')} - {semgrep.get('message', '')}")
         print()
 
+        # pip-audit Results
+        print("PIP-AUDIT (Dependency Vulnerabilities)")
+        print("-" * 80)
+        if self.results['pip_audit']:
+            pip_audit = self.results['pip_audit']
+            if pip_audit.get('status') == 'success':
+                print(f"  Status: {'✅ PASS' if pip_audit['total_vulnerabilities'] == 0 else '⚠️  VULNERABILITIES FOUND'}")
+                print(f"  Total Vulnerabilities: {pip_audit['total_vulnerabilities']}")
+                print(f"  Files Scanned: {pip_audit.get('files_scanned', 0)}")
+
+                if detailed and pip_audit.get('details'):
+                    print("\n  Vulnerable Packages:")
+                    for vuln in pip_audit['details'][:10]:  # Show first 10
+                        package = vuln.get('name', 'Unknown')
+                        version = vuln.get('version', 'Unknown')
+                        vuln_id = vuln.get('id', 'Unknown')
+                        print(f"    [{vuln_id}] {package} {version}")
+                        if 'requirements_file' in vuln:
+                            print(f"      File: {vuln['requirements_file']}")
+            elif pip_audit.get('status') == 'skipped':
+                print(f"  Status: {pip_audit.get('message', 'Skipped')}")
+            else:
+                print(f"  Status: {pip_audit.get('status')} - {pip_audit.get('message', '')}")
+        print()
+
+        # detect-secrets Results
+        print("DETECT-SECRETS (Secret Detection)")
+        print("-" * 80)
+        if self.results['detect_secrets']:
+            detect_secrets = self.results['detect_secrets']
+            if detect_secrets.get('status') == 'success':
+                print(f"  Status: {'✅ PASS' if detect_secrets['total_secrets'] == 0 else '🔴 SECRETS FOUND'}")
+                print(f"  Total Secrets: {detect_secrets['total_secrets']}")
+                print(f"  Files with Secrets: {detect_secrets.get('files_with_secrets', 0)}")
+
+                if detailed and detect_secrets.get('details'):
+                    print("\n  Detected Secrets:")
+                    for secret in detect_secrets['details'][:10]:  # Show first 10
+                        print(f"    [{secret.get('type')}] {secret.get('file')}:{secret.get('line_number')}")
+            elif detect_secrets.get('status') == 'skipped':
+                print(f"  Status: {detect_secrets.get('message', 'Skipped')}")
+            else:
+                print(f"  Status: {detect_secrets.get('status')} - {detect_secrets.get('message', '')}")
+        print()
+
         # Summary
         print("=" * 80)
         print("SUMMARY")
@@ -294,6 +507,10 @@ class SecurityScanner:
         print(f"\nOverall Status: {summary['overall_status']}")
         print(f"Total Issues: {summary['total_issues']}")
         print(f"Critical Issues: {summary['critical_issues']}")
+        if summary.get('vulnerable_dependencies', 0) > 0:
+            print(f"Vulnerable Dependencies: {summary['vulnerable_dependencies']}")
+        if summary.get('secrets_found', 0) > 0:
+            print(f"Secrets Found: {summary['secrets_found']}")
         print("\nRecommendations:")
         for rec in summary['recommendations']:
             print(f"  • {rec}")
@@ -314,7 +531,7 @@ class SecurityScanner:
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description='Security Scanner - Run Bandit and Semgrep on a repository',
+        description='Enhanced Security Scanner - Comprehensive security analysis with multiple tools',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -323,8 +540,14 @@ Examples:
   %(prog)s /path/to/repo --json results.json
   %(prog)s . --detailed --json scan_results.json
 
+Tools Included:
+  - Bandit: Python SAST security scanner
+  - Semgrep: Multi-language SAST scanner
+  - pip-audit: Python dependency vulnerability scanner
+  - detect-secrets: Secret detection in code
+
 Installation:
-  pip install bandit semgrep
+  pip install bandit semgrep pip-audit detect-secrets
         """
     )
 
