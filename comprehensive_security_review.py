@@ -537,12 +537,16 @@ Suppressions File:
             print(f"{'='*80}")
 
             for filepath, issues in files.items():
-                print(f"\n  📄 {filepath}")
-
                 # Group by severity
                 critical = [i for i in issues if i['severity'] == 'critical']
                 high = [i for i in issues if i['severity'] == 'high']
                 medium = [i for i in issues if i['severity'] == 'medium']
+
+                # Only print file if it has issues to display
+                if not (critical or high or medium):
+                    continue
+
+                print(f"\n  📄 {filepath}")
 
                 if critical:
                     print(f"    🔴 CRITICAL ISSUES:")
