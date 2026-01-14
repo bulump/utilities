@@ -13,34 +13,151 @@ A comprehensive security scanner that combines industry-standard security analys
 - Runs **Semgrep** (multi-language SAST) for cross-language security analysis
 - Runs **pip-audit** to scan Python dependencies for known CVEs
 - Runs **detect-secrets** to find hardcoded secrets and credentials
+- Runs **dotnet list package --vulnerable** to scan .NET/NuGet dependencies for CVEs
 - Provides detailed and summary reporting modes
 - Exports results to JSON for CI/CD integration
-- Categorizes issues by severity (High/Medium/Low)
+- Categorizes issues by severity (Critical/High/Medium/Low)
 - Returns proper exit codes for automation
 
+**Usage:**
+```bash
+python script_security_scanner.py /path/to/repo
+python script_security_scanner.py /path/to/repo --detailed
+python script_security_scanner.py /path/to/repo --json results.json
+```
+
+---
+
+### comprehensive_security_review.py
+
+A fast, regex-based security scanner for Python and C# codebases. No external tools required.
+
+**Features:**
+- Scans Python (.py) and C# (.cs) files
+- Auto-excludes test directories by default
+- Supports suppressions file for whitelisting
+- Provides line numbers for all findings
+- Fast execution (no external dependencies)
+
+**Usage:**
+```bash
+# Scan a single repository
+python comprehensive_security_review.py /path/to/repo
+
+# Scan all projects in ~/git/
+python comprehensive_security_review.py
+
+# Include test files (excluded by default)
+python comprehensive_security_review.py /path/to/repo --include-tests
+
+# Exclude additional patterns
+python comprehensive_security_review.py /path/to/repo --exclude "*.Generated.cs" --exclude "**/Migrations/*"
+
+# Ignore suppressions file
+python comprehensive_security_review.py /path/to/repo --no-suppressions
+```
+
 **Detects:**
-- **Code vulnerabilities:** SQL injection, XSS, command injection, path traversal
-- **Dependency vulnerabilities:** Known CVEs in Python packages (via pip-audit)
-- **Secrets:** Hardcoded API keys, passwords, tokens, credentials (via detect-secrets)
-- **Cryptographic issues:** Weak algorithms, insecure key generation
-- **Unsafe practices:** Insecure deserialization, eval/exec usage
-- And many more security issues across multiple languages
+
+| Category | Python | C#/.NET |
+|----------|--------|---------|
+| Hardcoded Secrets | Passwords, API keys, tokens | Passwords, connection strings, API keys |
+| Injection | SQL injection, command injection (os.system, subprocess) | SQL injection, command injection (Process.Start), LDAP injection |
+| Insecure Deserialization | pickle.loads | BinaryFormatter, SoapFormatter, NetDataContractSerializer |
+| XSS | - | Html.Raw, Response.Write |
+| Weak Cryptography | MD5, SHA1 | MD5, SHA1, DES, RC2, TripleDES |
+| Other | eval(), exec(), debug mode, path traversal | System.Random for security, debug/trace enabled |
+
+---
+
+## Suppressions File
+
+Create a `.security-suppressions.json` file in your repository root to exclude files or suppress specific findings.
+
+### File Location
+
+The suppressions file must be placed in the **root of the repository being scanned**.
+
+### Format
+
+```json
+{
+  "exclude_patterns": [
+    "*.Generated.cs",
+    "**/Migrations/*",
+    "**/obj/*"
+  ],
+  "suppress_rules": {
+    "Path/To/File.cs": ["rule-keyword"],
+    "Path/To/File.cs:123": ["all"]
+  }
+}
+```
+
+### Example
+
+```json
+{
+  "exclude_patterns": [
+    "*.Generated.cs",
+    "*.Designer.cs",
+    "**/Migrations/*"
+  ],
+  "suppress_rules": {
+    "MyProject.Infrastructure/Db/Repository.cs": ["hardcoded-api-key"],
+    "MyProject.Config/Settings.cs": ["hardcoded-password", "connection-string"],
+    "MyProject.Legacy/OldCode.cs:45": ["all"]
+  }
+}
+```
+
+### Rule Keywords
+
+Rule matching is **partial, case-insensitive**, and supports **hyphens, underscores, or spaces**:
+- `"hardcoded-api-key"`, `"hardcoded_api_key"`, and `"hardcoded api key"` all work
+
+**Python Rules:**
+
+| Severity | Keywords |
+|----------|----------|
+| CRITICAL | `hardcoded-password`, `hardcoded-api-key-openai`, `hardcoded-github-token`, `command-injection-os-system`, `eval`, `exec` |
+| HIGH | `hardcoded-api-key`, `hardcoded-secret`, `hardcoded-token`, `sql-injection`, `subprocess-shell`, `pickle`, `path-traversal` |
+| MEDIUM | `os-system`, `md5`, `sha1`, `debug-mode` |
+
+**C#/.NET Rules:**
+
+| Severity | Keywords |
+|----------|----------|
+| CRITICAL | `hardcoded-password`, `connection-string`, `binaryformatter`, `soapformatter`, `netdatacontractserializer`, `xss-response-write` |
+| HIGH | `hardcoded-api-key`, `hardcoded-secret`, `sql-injection`, `process-start`, `des`, `rc2`, `path-traversal`, `ldap-injection`, `html-raw`, `system-random` |
+| MEDIUM | `javascriptserializer`, `md5`, `sha1`, `tripledes`, `debug-mode`, `trace-enabled` |
+| LOW | `hardcoded-ip` |
+
+### Special Values
+
+- `"all"` - Suppress all rules for a file or line
+- File paths must match exactly as shown in scanner output
+- Line-specific suppressions use format: `"Path/To/File.cs:123"`
+
+---
 
 ## Installation
 
 ### Prerequisites
 
-Install the security scanning tools:
+For `script_security_scanner.py`, install the security scanning tools:
 
 ```bash
 pip install bandit semgrep pip-audit detect-secrets
 ```
 
-Or install from the repository's requirements.txt:
+Or install from requirements.txt:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+For `comprehensive_security_review.py`, no external dependencies are required.
 
 ### Clone this repository
 
@@ -49,112 +166,17 @@ git clone https://github.com/bulump/utilities.git
 cd utilities
 ```
 
-## Usage
-
-### Basic Scan
-
-Run a security scan on a repository:
-
-```bash
-python script_security_scanner.py /path/to/your/repo
-```
-
-### Detailed Output
-
-Get detailed information about each security issue:
-
-```bash
-python script_security_scanner.py /path/to/your/repo --detailed
-```
-
-### Export to JSON
-
-Save results to a JSON file for CI/CD integration:
-
-```bash
-python script_security_scanner.py /path/to/your/repo --json results.json
-```
-
-### Combined Options
-
-```bash
-python script_security_scanner.py /path/to/your/repo --detailed --json scan_results.json
-```
-
-## Example Output
-
-```
-🔒 Security Scanner
-Repository: /path/to/your/repo
-
-Running Bandit (Python Security Scanner)...
-Running Semgrep (Multi-language SAST)...
-Running pip-audit (Dependency Vulnerability Scanner)...
-Running detect-secrets (Secret Detection)...
-
-================================================================================
-SECURITY SCAN RESULTS
-================================================================================
-
-Repository: /path/to/your/repo
-Scan Date: 2025-10-24T14:56:33
-
-BANDIT (Python Security)
---------------------------------------------------------------------------------
-  Status: ✅ PASS
-  Total Issues: 3
-    High: 0
-    Medium: 2
-    Low: 1
-
-SEMGREP (Multi-language SAST)
---------------------------------------------------------------------------------
-  Status: ✅ PASS
-  Total Findings: 5
-    Errors/High: 0
-    Warnings/Medium: 3
-    Info/Low: 2
-
-PIP-AUDIT (Dependency Vulnerabilities)
---------------------------------------------------------------------------------
-  Status: ⚠️  VULNERABILITIES FOUND
-  Total Vulnerabilities: 2
-  Files Scanned: 1
-
-DETECT-SECRETS (Secret Detection)
---------------------------------------------------------------------------------
-  Status: ✅ PASS
-  Total Secrets: 0
-  Files with Secrets: 0
-
-================================================================================
-SUMMARY
-================================================================================
-
-Overall Status: WARN
-Total Issues: 10
-Critical Issues: 2
-Vulnerable Dependencies: 2
-
-Recommendations:
-  • Review and address medium/low severity issues
-  • Update vulnerable dependencies to secure versions
-```
-
-## Exit Codes
-
-- `0`: Success - no critical issues found
-- `1`: Failure - critical/high severity issues detected
+---
 
 ## CI/CD Integration
 
-Add to your GitHub Actions workflow:
+### GitHub Actions - Full Scanner
 
 ```yaml
 - name: Run Security Scan
   run: |
     pip install bandit semgrep pip-audit detect-secrets
-    python script_security_scanner.py . --json security-results.json
+    python script_security_scanner.py . --detailed --json security-results.json
 
 - name: Upload Security Results
   uses: actions/upload-artifact@v3
@@ -163,23 +185,26 @@ Add to your GitHub Actions workflow:
     path: security-results.json
 ```
 
-Or use the requirements.txt:
+### GitHub Actions - Fast Scanner
 
 ```yaml
-- name: Run Security Scan
+- name: Run Comprehensive Security Review
   run: |
-    pip install -r requirements.txt
-    python script_security_scanner.py . --detailed --json security-results.json
+    python comprehensive_security_review.py . --exclude "*.Generated.cs"
 ```
 
-## Requirements
+---
 
-See `requirements.txt` for Python dependencies.
+## Exit Codes
+
+| Scanner | Code | Meaning |
+|---------|------|---------|
+| script_security_scanner.py | 0 | No critical issues |
+| script_security_scanner.py | 1 | Critical/high issues detected |
+| comprehensive_security_review.py | 0 | Always (informational) |
+
+---
 
 ## License
 
 MIT License
-
-## Author
-
-Built with Claude AI

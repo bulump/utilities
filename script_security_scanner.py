@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+from collections import defaultdict
+import textwrap
 
 
 class SecurityScanner:
@@ -39,6 +41,7 @@ class SecurityScanner:
             'semgrep': None,
             'pip_audit': None,
             'detect_secrets': None,
+            'dotnet_audit': None,
             'summary': None
         }
 
@@ -73,6 +76,13 @@ class SecurityScanner:
             tools['detect_secrets'] = True
         except (subprocess.CalledProcessError, FileNotFoundError):
             tools['detect_secrets'] = False
+
+        # Check dotnet CLI
+        try:
+            subprocess.run(['dotnet', '--version'], capture_output=True, check=True)
+            tools['dotnet'] = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            tools['dotnet'] = False
 
         return tools
 
@@ -287,6 +297,106 @@ class SecurityScanner:
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
 
+    def run_dotnet_audit(self) -> Dict[str, Any]:
+        """
+        Run dotnet list package --vulnerable to check for .NET dependency vulnerabilities.
+
+        Returns:
+            Dictionary with dotnet audit results
+        """
+        print("Running dotnet list package --vulnerable (.NET Dependency Scanner)...")
+
+        try:
+            # Look for .csproj or .sln files
+            csproj_files = list(self.repo_path.glob('**/*.csproj'))
+            sln_files = list(self.repo_path.glob('**/*.sln'))
+
+            if not csproj_files and not sln_files:
+                return {
+                    'status': 'skipped',
+                    'message': 'No .NET project files found (.csproj or .sln)',
+                    'total_vulnerabilities': 0
+                }
+
+            all_vulnerabilities = []
+            projects_scanned = []
+
+            # Scan each .csproj file
+            for csproj_file in csproj_files:
+                project_dir = csproj_file.parent
+                rel_path = str(csproj_file.relative_to(self.repo_path))
+
+                result = subprocess.run(
+                    ['dotnet', 'list', str(csproj_file), 'package', '--vulnerable', '--format', 'json'],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    cwd=project_dir
+                )
+
+                projects_scanned.append(rel_path)
+
+                try:
+                    if result.stdout:
+                        data = json.loads(result.stdout)
+                        # Parse the dotnet vulnerable packages output
+                        for project in data.get('projects', []):
+                            for framework in project.get('frameworks', []):
+                                for pkg in framework.get('topLevelPackages', []):
+                                    if pkg.get('vulnerabilities'):
+                                        for vuln in pkg['vulnerabilities']:
+                                            all_vulnerabilities.append({
+                                                'project': rel_path,
+                                                'framework': framework.get('framework', 'unknown'),
+                                                'package': pkg.get('id', 'Unknown'),
+                                                'version': pkg.get('resolvedVersion', 'Unknown'),
+                                                'severity': vuln.get('severity', 'Unknown'),
+                                                'advisory_url': vuln.get('advisoryurl', '')
+                                            })
+                                for pkg in framework.get('transitivePackages', []):
+                                    if pkg.get('vulnerabilities'):
+                                        for vuln in pkg['vulnerabilities']:
+                                            all_vulnerabilities.append({
+                                                'project': rel_path,
+                                                'framework': framework.get('framework', 'unknown'),
+                                                'package': pkg.get('id', 'Unknown'),
+                                                'version': pkg.get('resolvedVersion', 'Unknown'),
+                                                'severity': vuln.get('severity', 'Unknown'),
+                                                'advisory_url': vuln.get('advisoryurl', ''),
+                                                'transitive': True
+                                            })
+                except json.JSONDecodeError:
+                    # Older dotnet versions may not support --format json
+                    # Fall back to text parsing
+                    if 'has the following vulnerable packages' in result.stdout:
+                        all_vulnerabilities.append({
+                            'project': rel_path,
+                            'raw_output': result.stdout,
+                            'note': 'JSON parsing failed, vulnerabilities detected in text output'
+                        })
+
+            # Categorize by severity
+            critical = [v for v in all_vulnerabilities if v.get('severity', '').lower() == 'critical']
+            high = [v for v in all_vulnerabilities if v.get('severity', '').lower() == 'high']
+            moderate = [v for v in all_vulnerabilities if v.get('severity', '').lower() in ['moderate', 'medium']]
+            low = [v for v in all_vulnerabilities if v.get('severity', '').lower() == 'low']
+
+            return {
+                'status': 'success',
+                'total_vulnerabilities': len(all_vulnerabilities),
+                'critical': len(critical),
+                'high': len(high),
+                'moderate': len(moderate),
+                'low': len(low),
+                'details': all_vulnerabilities,
+                'projects_scanned': len(projects_scanned)
+            }
+
+        except subprocess.TimeoutExpired:
+            return {'status': 'error', 'message': 'dotnet audit scan timed out'}
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
     def run_scan(self) -> Dict[str, Any]:
         """
         Run full security scan with all tools.
@@ -331,6 +441,13 @@ class SecurityScanner:
             print("⚠️  detect-secrets not installed, skipping secret detection")
             self.results['detect_secrets'] = {'status': 'skipped', 'message': 'Tool not installed'}
 
+        # Run dotnet audit
+        if tools.get('dotnet'):
+            self.results['dotnet_audit'] = self.run_dotnet_audit()
+        else:
+            print("⚠️  dotnet CLI not installed, skipping .NET dependency scan")
+            self.results['dotnet_audit'] = {'status': 'skipped', 'message': 'Tool not installed'}
+
         # Generate summary
         self.results['summary'] = self._generate_summary()
 
@@ -343,6 +460,7 @@ class SecurityScanner:
             'total_issues': 0,
             'critical_issues': 0,
             'vulnerable_dependencies': 0,
+            'dotnet_vulnerabilities': 0,
             'secrets_found': 0,
             'recommendations': []
         }
@@ -377,6 +495,16 @@ class SecurityScanner:
             if secrets > 0:
                 summary['critical_issues'] += secrets
 
+        # dotnet audit summary
+        if self.results['dotnet_audit'] and self.results['dotnet_audit'].get('status') == 'success':
+            dotnet_vulns = self.results['dotnet_audit']['total_vulnerabilities']
+            dotnet_critical = self.results['dotnet_audit'].get('critical', 0)
+            dotnet_high = self.results['dotnet_audit'].get('high', 0)
+            summary['total_issues'] += dotnet_vulns
+            summary['dotnet_vulnerabilities'] = dotnet_vulns
+            if dotnet_critical > 0 or dotnet_high > 0:
+                summary['critical_issues'] += dotnet_critical + dotnet_high
+
         # Determine overall status
         if summary['critical_issues'] > 0:
             summary['overall_status'] = 'FAIL'
@@ -389,7 +517,9 @@ class SecurityScanner:
 
         # Specific recommendations
         if summary['vulnerable_dependencies'] > 0:
-            summary['recommendations'].append('Update vulnerable dependencies to secure versions')
+            summary['recommendations'].append('Update vulnerable Python dependencies to secure versions')
+        if summary['dotnet_vulnerabilities'] > 0:
+            summary['recommendations'].append('Update vulnerable .NET/NuGet packages to secure versions')
         if summary['secrets_found'] > 0:
             summary['recommendations'].append('Remove hardcoded secrets and use environment variables')
 
@@ -442,14 +572,56 @@ class SecurityScanner:
                 print(f"    Warnings/Medium: {semgrep['warnings']}")
                 print(f"    Info/Low: {semgrep['info']}")
 
-                if detailed and semgrep['details']:
-                    print("\n  Detailed Findings:")
-                    for finding in semgrep['details'][:10]:  # Show first 10
+                if semgrep['details']:
+                    # Group findings by check_id/rule to show summary
+                    by_rule = defaultdict(list)
+                    for finding in semgrep['details']:
+                        rule_id = finding.get('check_id', 'unknown')
                         severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
-                        message = finding.get('extra', {}).get('message', 'No description')
-                        path = finding.get('path', '?')
-                        print(f"    [{severity}] {path}")
-                        print(f"      {message[:100]}")
+                        by_rule[(severity, rule_id)].append(finding)
+
+                    # Sort by severity (ERROR/HIGH first)
+                    severity_order = {'ERROR': 0, 'HIGH': 0, 'WARNING': 1, 'MEDIUM': 1, 'INFO': 2, 'LOW': 2}
+                    sorted_rules = sorted(by_rule.items(), key=lambda x: (severity_order.get(x[0][0], 3), -len(x[1])))
+
+                    print("\n  Issues by Type:")
+                    for (severity, rule_id), findings in sorted_rules:
+                        # Shorten rule_id for display
+                        short_rule = rule_id.split('.')[-1] if '.' in rule_id else rule_id
+                        print(f"    [{severity}] {short_rule}: {len(findings)} occurrence(s)")
+
+                    if detailed:
+                        # Show HIGH/ERROR issues first and completely
+                        high_findings = [f for f in semgrep['details']
+                                        if f.get('extra', {}).get('severity') in ['ERROR', 'HIGH']]
+                        medium_findings = [f for f in semgrep['details']
+                                          if f.get('extra', {}).get('severity') in ['WARNING', 'MEDIUM']]
+
+                        if high_findings:
+                            print(f"\n  🔴 HIGH/ERROR Severity Details ({len(high_findings)} issues):")
+                            for finding in high_findings:
+                                severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
+                                message = finding.get('extra', {}).get('message', 'No description')
+                                path = finding.get('path', '?')
+                                line = finding.get('start', {}).get('line', '?')
+                                rule_id = finding.get('check_id', 'unknown').split('.')[-1]
+                                print(f"    [{severity}] {path}:{line}")
+                                print(f"      Rule: {rule_id}")
+                                wrapped = textwrap.fill(message, width=100, initial_indent='      ', subsequent_indent='      ')
+                                print(wrapped)
+
+                        if medium_findings:
+                            print(f"\n  🟡 MEDIUM/WARNING Severity Details ({len(medium_findings)} issues):")
+                            for finding in medium_findings[:15]:  # Limit medium to 15
+                                severity = finding.get('extra', {}).get('severity', 'UNKNOWN')
+                                message = finding.get('extra', {}).get('message', 'No description')
+                                path = finding.get('path', '?')
+                                line = finding.get('start', {}).get('line', '?')
+                                print(f"    [{severity}] {path}:{line}")
+                                wrapped = textwrap.fill(message, width=100, initial_indent='      ', subsequent_indent='      ')
+                                print(wrapped)
+                            if len(medium_findings) > 15:
+                                print(f"    ... and {len(medium_findings) - 15} more medium severity issues")
             else:
                 print(f"  Status: {semgrep.get('status')} - {semgrep.get('message', '')}")
         print()
@@ -499,6 +671,38 @@ class SecurityScanner:
                 print(f"  Status: {detect_secrets.get('status')} - {detect_secrets.get('message', '')}")
         print()
 
+        # dotnet audit Results
+        print("DOTNET AUDIT (.NET/NuGet Vulnerabilities)")
+        print("-" * 80)
+        if self.results['dotnet_audit']:
+            dotnet_audit = self.results['dotnet_audit']
+            if dotnet_audit.get('status') == 'success':
+                print(f"  Status: {'✅ PASS' if dotnet_audit['total_vulnerabilities'] == 0 else '⚠️  VULNERABILITIES FOUND'}")
+                print(f"  Total Vulnerabilities: {dotnet_audit['total_vulnerabilities']}")
+                print(f"    Critical: {dotnet_audit.get('critical', 0)}")
+                print(f"    High: {dotnet_audit.get('high', 0)}")
+                print(f"    Moderate: {dotnet_audit.get('moderate', 0)}")
+                print(f"    Low: {dotnet_audit.get('low', 0)}")
+                print(f"  Projects Scanned: {dotnet_audit.get('projects_scanned', 0)}")
+
+                if detailed and dotnet_audit.get('details'):
+                    print("\n  Vulnerable Packages:")
+                    for vuln in dotnet_audit['details'][:10]:  # Show first 10
+                        package = vuln.get('package', 'Unknown')
+                        version = vuln.get('version', 'Unknown')
+                        severity = vuln.get('severity', 'Unknown')
+                        project = vuln.get('project', 'Unknown')
+                        transitive = ' (transitive)' if vuln.get('transitive') else ''
+                        print(f"    [{severity}] {package} {version}{transitive}")
+                        print(f"      Project: {project}")
+                        if vuln.get('advisory_url'):
+                            print(f"      Advisory: {vuln['advisory_url']}")
+            elif dotnet_audit.get('status') == 'skipped':
+                print(f"  Status: {dotnet_audit.get('message', 'Skipped')}")
+            else:
+                print(f"  Status: {dotnet_audit.get('status')} - {dotnet_audit.get('message', '')}")
+        print()
+
         # Summary
         print("=" * 80)
         print("SUMMARY")
@@ -508,7 +712,9 @@ class SecurityScanner:
         print(f"Total Issues: {summary['total_issues']}")
         print(f"Critical Issues: {summary['critical_issues']}")
         if summary.get('vulnerable_dependencies', 0) > 0:
-            print(f"Vulnerable Dependencies: {summary['vulnerable_dependencies']}")
+            print(f"Vulnerable Python Dependencies: {summary['vulnerable_dependencies']}")
+        if summary.get('dotnet_vulnerabilities', 0) > 0:
+            print(f"Vulnerable .NET Dependencies: {summary['dotnet_vulnerabilities']}")
         if summary.get('secrets_found', 0) > 0:
             print(f"Secrets Found: {summary['secrets_found']}")
         print("\nRecommendations:")
