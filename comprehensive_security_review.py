@@ -99,6 +99,41 @@ def filter_suppressed_issues(rel_path, issues, suppress_rules):
     return filtered_issues
 
 
+def is_in_comment(content, position, language='csharp'):
+    """Check if a position in the content is within a comment."""
+    if language == 'csharp':
+        # Check for single-line comment: find the line and see if // appears before position
+        line_start = content.rfind('\n', 0, position) + 1
+        line_content = content[line_start:position]
+        if '//' in line_content:
+            return True
+
+        # Check for multi-line comment /* */
+        # Find the last /* before position
+        last_open = content.rfind('/*', 0, position)
+        if last_open != -1:
+            # Check if there's a */ between the /* and our position
+            last_close = content.rfind('*/', last_open, position)
+            if last_close == -1:
+                return True  # We're inside /* */ block
+
+    elif language == 'python':
+        # Check for single-line comment
+        line_start = content.rfind('\n', 0, position) + 1
+        line_content = content[line_start:position]
+        if '#' in line_content:
+            return True
+
+        # Check for multi-line docstrings (""" or ''')
+        for quote in ['"""', "'''"]:
+            # Count occurrences before position
+            count = content[:position].count(quote)
+            if count % 2 == 1:
+                return True  # Odd count means we're inside a docstring
+
+    return False
+
+
 def find_pattern_with_line(content, pattern, flags=0):
     """Find pattern and return (match, line_number) or (None, 0) if not found."""
     match = re.search(pattern, content, flags)
@@ -149,6 +184,10 @@ def review_python_file(filepath):
     for pattern, issue_name, severity in secret_patterns:
         matches = re.finditer(pattern, content, re.IGNORECASE)
         for match in matches:
+            # Skip matches inside comments
+            if is_in_comment(content, match.start(), 'python'):
+                continue
+
             # Exclude environment variable references
             matched_text = match.group()
             if 'os.getenv' not in content[max(0, match.start()-50):match.end()+50] and \
@@ -163,16 +202,24 @@ def review_python_file(filepath):
                     'context': matched_text[:50]
                 })
 
-    # 2. SQL Injection
+    # 2. SQL Injection - using SQL grammar structure patterns (case-insensitive)
     sql_patterns = [
         (r'execute\s*\([^)]*\+', 'HIGH: Possible SQL injection (string concatenation)', 'high'),
-        (r'\.format\s*\([^)]*SELECT', 'HIGH: Possible SQL injection (format with SELECT)', 'high'),
-        (r'f["\'].*SELECT.*\{', 'HIGH: Possible SQL injection (f-string with SELECT)', 'high'),
+        # .format() with SQL structure
+        (r'\.format\s*\([^)]*SELECT\s+.+\s+FROM', 'HIGH: Possible SQL injection (format with SELECT FROM)', 'high'),
+        (r'\.format\s*\([^)]*INSERT\s+INTO', 'HIGH: Possible SQL injection (format with INSERT INTO)', 'high'),
+        (r'\.format\s*\([^)]*UPDATE\s+.+\s+SET', 'HIGH: Possible SQL injection (format with UPDATE SET)', 'high'),
+        (r'\.format\s*\([^)]*DELETE\s+FROM', 'HIGH: Possible SQL injection (format with DELETE FROM)', 'high'),
+        # f-strings with SQL structure
+        (r'f["\'].*SELECT\s+.+\s+FROM\s+.*\{', 'HIGH: Possible SQL injection (f-string with SELECT FROM)', 'high'),
+        (r'f["\'].*INSERT\s+INTO\s+.*\{', 'HIGH: Possible SQL injection (f-string with INSERT INTO)', 'high'),
+        (r'f["\'].*UPDATE\s+.+\s+SET\s+.*\{', 'HIGH: Possible SQL injection (f-string with UPDATE SET)', 'high'),
+        (r'f["\'].*DELETE\s+FROM\s+.*\{', 'HIGH: Possible SQL injection (f-string with DELETE FROM)', 'high'),
     ]
 
     for pattern, issue_name, severity in sql_patterns:
         match, line_num = find_pattern_with_line(content, pattern, re.IGNORECASE)
-        if match:
+        if match and not is_in_comment(content, match.start(), 'python'):
             issues.append({'severity': severity, 'line': line_num, 'issue': issue_name, 'context': ''})
 
     # 3. Command Injection
@@ -246,7 +293,7 @@ def review_csharp_file(filepath):
     secret_patterns = [
         (r'[Pp]assword\s*=\s*"[^"]{3,}"', 'CRITICAL: Hardcoded password', 'critical'),
         (r'[Cc]onnection[Ss]tring\s*=\s*"[^"]*[Pp]assword=[^"]*"', 'CRITICAL: Hardcoded connection string with password', 'critical'),
-        (r'"[a-zA-Z0-9]{32,}"', 'HIGH: Possible hardcoded API key or secret', 'high'),
+        (r'"(?=[a-zA-Z0-9]*\d)[a-zA-Z0-9]{32,}"', 'HIGH: Possible hardcoded API key or secret', 'high'),
         (r'[Aa]pi[Kk]ey\s*=\s*"[^"]{10,}"', 'HIGH: Possible hardcoded API key', 'high'),
         (r'[Ss]ecret\s*=\s*"[^"]{10,}"', 'HIGH: Possible hardcoded secret', 'high'),
     ]
@@ -254,6 +301,10 @@ def review_csharp_file(filepath):
     for pattern, issue_name, severity in secret_patterns:
         matches = re.finditer(pattern, content)
         for match in matches:
+            # Skip matches inside comments
+            if is_in_comment(content, match.start(), 'csharp'):
+                continue
+
             matched_text = match.group()
             # Exclude configuration placeholders and env var patterns
             if 'Environment.GetEnvironmentVariable' not in content[max(0, match.start()-100):match.end()+100] and \
@@ -261,29 +312,42 @@ def review_csharp_file(filepath):
                '{0}' not in matched_text and \
                'Configuration[' not in content[max(0, match.start()-50):match.end()+50]:
                 line_num = content[:match.start()].count('\n') + 1
+                final_issue_name = issue_name
+                # For generic long string pattern, check digit count for false positive warning
+                if 'Possible hardcoded API key or secret' in issue_name:
+                    digit_count = sum(1 for c in matched_text if c.isdigit())
+                    if digit_count <= 2:
+                        final_issue_name = issue_name + ' (may be false positive - low digit count)'
                 issues.append({
                     'severity': severity,
                     'line': line_num,
-                    'issue': issue_name,
+                    'issue': final_issue_name,
                     'context': matched_text[:50]
                 })
 
-    # 2. SQL Injection
+    # 2. SQL Injection - using SQL grammar structure patterns (case-insensitive)
     sql_patterns = [
         (r'ExecuteReader\s*\([^)]*\+', 'HIGH: Possible SQL injection (string concatenation)', 'high'),
         (r'ExecuteNonQuery\s*\([^)]*\+', 'HIGH: Possible SQL injection (string concatenation)', 'high'),
         (r'ExecuteScalar\s*\([^)]*\+', 'HIGH: Possible SQL injection (string concatenation)', 'high'),
-        (r'\$"[^"]*SELECT[^"]*\{', 'HIGH: Possible SQL injection (interpolated string with SELECT)', 'high'),
-        (r'\$"[^"]*INSERT[^"]*\{', 'HIGH: Possible SQL injection (interpolated string with INSERT)', 'high'),
-        (r'\$"[^"]*UPDATE[^"]*\{', 'HIGH: Possible SQL injection (interpolated string with UPDATE)', 'high'),
-        (r'\$"[^"]*DELETE[^"]*\{', 'HIGH: Possible SQL injection (interpolated string with DELETE)', 'high'),
-        (r'string\.Format\s*\([^)]*SELECT', 'HIGH: Possible SQL injection (Format with SELECT)', 'high'),
+        # SELECT ... FROM with interpolation
+        (r'\$"[^"]*SELECT\s+.+\s+FROM\s+[^"]*\{', 'HIGH: Possible SQL injection (interpolated SELECT FROM)', 'high'),
+        # INSERT INTO with interpolation
+        (r'\$"[^"]*INSERT\s+INTO\s+[^"]*\{', 'HIGH: Possible SQL injection (interpolated INSERT INTO)', 'high'),
+        # UPDATE ... SET with interpolation
+        (r'\$"[^"]*UPDATE\s+.+\s+SET\s+[^"]*\{', 'HIGH: Possible SQL injection (interpolated UPDATE SET)', 'high'),
+        # DELETE FROM or DELETE ... WHERE with interpolation
+        (r'\$"[^"]*DELETE\s+FROM\s+[^"]*\{', 'HIGH: Possible SQL injection (interpolated DELETE FROM)', 'high'),
+        (r'\$"[^"]*DELETE\s+.+\s+WHERE\s+[^"]*\{', 'HIGH: Possible SQL injection (interpolated DELETE WHERE)', 'high'),
+        # string.Format with SQL
+        (r'string\.Format\s*\([^)]*SELECT\s+.+\s+FROM', 'HIGH: Possible SQL injection (Format with SELECT)', 'high'),
+        # EF Core raw SQL
         (r'FromSqlRaw\s*\(\s*\$"', 'HIGH: Possible SQL injection (FromSqlRaw with interpolation)', 'high'),
     ]
 
     for pattern, issue_name, severity in sql_patterns:
         match, line_num = find_pattern_with_line(content, pattern, re.IGNORECASE)
-        if match:
+        if match and not is_in_comment(content, match.start(), 'csharp'):
             issues.append({'severity': severity, 'line': line_num, 'issue': issue_name, 'context': ''})
 
     # 3. Command Injection
@@ -367,7 +431,7 @@ def review_csharp_file(filepath):
 
     # 11. Hardcoded IP addresses (potential security config issue)
     match, line_num = find_pattern_with_line(content, r'"(?:\d{1,3}\.){3}\d{1,3}"')
-    if match:
+    if match and not is_in_comment(content, match.start(), 'csharp'):
         issues.append({'severity': 'low', 'line': line_num, 'issue': 'LOW: Hardcoded IP address found', 'context': ''})
 
     # Deduplicate issues by (line, issue) - keep first occurrence
@@ -521,52 +585,86 @@ Suppressions File:
             critical = sum(1 for file_issues in results.values() for issue in file_issues if issue['severity'] == 'critical')
             high = sum(1 for file_issues in results.values() for issue in file_issues if issue['severity'] == 'high')
             medium = sum(1 for file_issues in results.values() for issue in file_issues if issue['severity'] == 'medium')
+            low = sum(1 for file_issues in results.values() for issue in file_issues if issue['severity'] == 'low')
 
-            project_summaries[project] = {'critical': critical, 'high': high, 'medium': medium, 'files': len(results)}
-            print(f"⚠️  {project}: {critical} critical, {high} high, {medium} medium")
+            project_summaries[project] = {'critical': critical, 'high': high, 'medium': medium, 'low': low, 'files': len(results)}
+            print(f"⚠️  {project}: {critical} critical, {high} high, {medium} medium, {low} low")
 
-    # Detailed results
+    # Detailed results - sorted by severity
     if all_results:
         print("\n" + "=" * 80)
-        print("DETAILED FINDINGS")
+        print("DETAILED FINDINGS (sorted by severity)")
         print("=" * 80)
+
+        # Severity order for sorting
+        severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
 
         for project, files in all_results.items():
             print(f"\n{'='*80}")
             print(f"PROJECT: {project}")
             print(f"{'='*80}")
 
+            # Collect all issues with file info and sort by severity
+            all_issues = []
             for filepath, issues in files.items():
-                # Group by severity
-                critical = [i for i in issues if i['severity'] == 'critical']
-                high = [i for i in issues if i['severity'] == 'high']
-                medium = [i for i in issues if i['severity'] == 'medium']
+                for issue in issues:
+                    all_issues.append({
+                        'filepath': filepath,
+                        'severity': issue['severity'],
+                        'line': issue.get('line', 0),
+                        'issue': issue['issue'],
+                        'context': issue.get('context', '')
+                    })
 
-                # Only print file if it has issues to display
-                if not (critical or high or medium):
+            # Group issues by severity, then by issue type, then by file
+            from collections import defaultdict
+
+            severity_labels = {
+                'critical': '🔴 CRITICAL',
+                'high': '🟠 HIGH',
+                'medium': '🟡 MEDIUM',
+                'low': '🔵 LOW'
+            }
+
+            # Organize: severity -> issue_text -> filepath -> list of lines
+            organized = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+            for issue in all_issues:
+                # Strip severity prefix from issue text
+                issue_text = issue['issue']
+                for prefix in ['CRITICAL: ', 'HIGH: ', 'MEDIUM: ', 'LOW: ']:
+                    if issue_text.startswith(prefix):
+                        issue_text = issue_text[len(prefix):]
+                        break
+                if issue['line'] > 0:
+                    organized[issue['severity']][issue_text][issue['filepath']].append(issue['line'])
+                else:
+                    organized[issue['severity']][issue_text][issue['filepath']].append(None)
+
+            # Print organized by severity, then by issue type
+            for severity in ['critical', 'high', 'medium', 'low']:
+                if severity not in organized:
                     continue
 
-                print(f"\n  📄 {filepath}")
+                label = severity_labels.get(severity, 'UNKNOWN')
+                print(f"\n  {label} ISSUES:")
 
-                if critical:
-                    print(f"    🔴 CRITICAL ISSUES:")
-                    for issue in critical:
-                        line_info = f" (line {issue['line']})" if issue.get('line', 0) > 0 else ""
-                        print(f"       - {issue['issue']}{line_info}")
-                        if issue.get('context'):
-                            print(f"         Context: {issue['context']}")
+                # Sort issues alphabetically
+                for issue_text in sorted(organized[severity].keys()):
+                    print(f"    ⚠ {issue_text}")
+                    files_dict = organized[severity][issue_text]
 
-                if high:
-                    print(f"    🟠 HIGH ISSUES:")
-                    for issue in high:
-                        line_info = f" (line {issue['line']})" if issue.get('line', 0) > 0 else ""
-                        print(f"       - {issue['issue']}{line_info}")
-
-                if medium:
-                    print(f"    🟡 MEDIUM ISSUES:")
-                    for issue in medium:
-                        line_info = f" (line {issue['line']})" if issue.get('line', 0) > 0 else ""
-                        print(f"       - {issue['issue']}{line_info}")
+                    # Sort files alphabetically
+                    for filepath in sorted(files_dict.keys()):
+                        lines = files_dict[filepath]
+                        # Filter out None values and sort line numbers
+                        valid_lines = sorted([l for l in lines if l is not None])
+                        if valid_lines:
+                            line_info = ', '.join(map(str, valid_lines))
+                            print(f"       {filepath}:{line_info}")
+                        else:
+                            print(f"       {filepath}")
+                    print()  # Blank line between issue types
 
     # Summary
     print("\n" + "=" * 80)
@@ -577,11 +675,13 @@ Suppressions File:
         total_critical = sum(s['critical'] for s in project_summaries.values())
         total_high = sum(s['high'] for s in project_summaries.values())
         total_medium = sum(s['medium'] for s in project_summaries.values())
+        total_low = sum(s['low'] for s in project_summaries.values())
 
         print(f"\n⚠️  Total Issues Found:")
         print(f"   🔴 CRITICAL: {total_critical}")
         print(f"   🟠 HIGH: {total_high}")
         print(f"   🟡 MEDIUM: {total_medium}")
+        print(f"   🔵 LOW: {total_low}")
 
         print(f"\nProjects with issues: {len(all_results)}/{len(projects)}")
 
@@ -589,9 +689,9 @@ Suppressions File:
         print("PROJECT BREAKDOWN:")
         print("-" * 80)
 
-        for project, summary in sorted(project_summaries.items(), key=lambda x: (x[1]['critical'], x[1]['high']), reverse=True):
-            status = "🔴" if summary['critical'] > 0 else "🟠" if summary['high'] > 0 else "🟡"
-            print(f"{status} {project:40} C:{summary['critical']} H:{summary['high']} M:{summary['medium']} ({summary['files']} files)")
+        for project, summary in sorted(project_summaries.items(), key=lambda x: (x[1]['critical'], x[1]['high'], x[1]['medium'], x[1]['low']), reverse=True):
+            status = "🔴" if summary['critical'] > 0 else "🟠" if summary['high'] > 0 else "🟡" if summary['medium'] > 0 else "🔵"
+            print(f"{status} {project:40} C:{summary['critical']} H:{summary['high']} M:{summary['medium']} L:{summary['low']} ({summary['files']} files)")
     else:
         print("\n✅ NO SECURITY ISSUES FOUND IN ANY PROJECT!")
         print(f"\n   Scanned {len(projects)} projects - all passed security review!")
